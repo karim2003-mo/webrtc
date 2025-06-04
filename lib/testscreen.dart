@@ -1,4 +1,3 @@
-import 'dart:core';
 import 'package:flutter/material.dart';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
@@ -19,13 +18,15 @@ class _VideoCallScreenState extends State<VideoCallScreen> {
   RTCPeerConnection? _peerConnection;
   MediaStream? _localStream;
   MediaStream? _screenStream;
+  bool _isSharingScreen = false;
+  bool _hasCameraError = false;
+  bool _hasMicError = false;
   final _firestore = FirebaseFirestore.instance;
 
   @override
   void initState() {
     super.initState();
-    _initRenderers();
-    _startCall();
+    _initRenderers().then((_) => _startCall());
   }
 
   Future<void> _initRenderers() async {
@@ -34,36 +35,65 @@ class _VideoCallScreenState extends State<VideoCallScreen> {
   }
 
   Future<void> _startCall() async {
-    // ignore: unnecessary_null_comparison
-    final config = {
-      'iceServers': [
-        {'urls': 'stun:stun.l.google.com:19302'}
-      ]
-    };
-  
-    
-      try{
-    _localStream = await navigator.mediaDevices.getUserMedia({
-      'audio': true,
-      'video': true,
-    });
-        }
-        catch (e) {
-          print('Error accessing media devices: $e');
-        }
-    _peerConnection = await createPeerConnection(config);
-    _peerConnection!.addStream(_localStream!);
-    _localRenderer.srcObject = _localStream;
+    try {
+      final config = {
+        'iceServers': [
+          {'urls': 'stun:stun.l.google.com:19302'}
+        ]
+      };
 
-    _peerConnection!.onAddStream = (stream) {
-      _remoteRenderer.srcObject = stream;
-    };
+      _peerConnection = await createPeerConnection(config);
 
+      // Try to get media with video first
+      try {
+        _localStream = await _getUserMedia(withVideo: true);
+        _localRenderer.srcObject = _localStream;
+        _peerConnection!.addStream(_localStream!);
+      } catch (e) {
+        print('Video error: $e');
+        // Try without video if video fails
+        _localStream = await _getUserMedia(withVideo: false);
+        _localRenderer.srcObject = _localStream;
+        _peerConnection!.addStream(_localStream!);
+        setState(() => _hasCameraError = true);
+      }
+
+      _setupPeerConnectionListeners();
+      
+      if (widget.isCaller) {
+        await _createOffer();
+      } else {
+        await _listenForOffer();
+      }
+    } catch (e) {
+      print('Call setup error: $e');
+      _showErrorDialog('Failed to start call: ${e.toString()}');
+    }
+  }
+
+  Future<MediaStream> _getUserMedia({bool withVideo = true}) async {
+    try {
+      final media = await navigator.mediaDevices.getUserMedia({
+        'audio': true,
+        'video': withVideo ? {
+          'width': {'ideal': 1280},
+          'height': {'ideal': 720},
+          'facingMode': 'user'
+        } : false,
+      });
+      return media;
+    } catch (e) {
+      if (e.toString().contains('audio')) {
+        setState(() => _hasMicError = true);
+      }
+      rethrow;
+    }
+  }
+
+  void _setupPeerConnectionListeners() {
     final roomRef = _firestore.collection('rooms').doc(widget.roomId);
-
-    // Collect ICE candidates
-    final callerCandidatesCollection = roomRef.collection('callerCandidates');
-    final calleeCandidatesCollection = roomRef.collection('calleeCandidates');
+    final callerCandidates = roomRef.collection('callerCandidates');
+    final calleeCandidates = roomRef.collection('calleeCandidates');
 
     _peerConnection!.onIceCandidate = (candidate) async {
       final json = {
@@ -72,113 +102,135 @@ class _VideoCallScreenState extends State<VideoCallScreen> {
         'sdpMLineIndex': candidate.sdpMLineIndex,
       };
 
-      if (widget.isCaller) {
-        await callerCandidatesCollection.add(json);
-      } else {
-        await calleeCandidatesCollection.add(json);
-      }
+      await (widget.isCaller ? callerCandidates : calleeCandidates).add(json);
     };
 
-    if (widget.isCaller) {
-      // Create Offer
-      final offer = await _peerConnection!.createOffer();
-      await _peerConnection!.setLocalDescription(offer);
-      await roomRef.set({'offer': offer.toMap()});
+    _peerConnection!.onAddStream = (stream) {
+      _remoteRenderer.srcObject = stream;
+    };
+  }
 
-      // Listen for answer
-      roomRef.snapshots().listen((snapshot) async {
-        if (snapshot.data() != null && snapshot.data()!.containsKey('answer')) {
-          final answer = RTCSessionDescription(
-            snapshot.data()!['answer']['sdp'],
-            snapshot.data()!['answer']['type'],
-          );
-          await _peerConnection!.setRemoteDescription(answer);
-        }
-      });
+  Future<void> _createOffer() async {
+    final roomRef = _firestore.collection('rooms').doc(widget.roomId);
+    final offer = await _peerConnection!.createOffer();
+    await _peerConnection!.setLocalDescription(offer);
+    await roomRef.set({'offer': offer.toMap()});
 
-      // Listen for callee ICE candidates
-      calleeCandidatesCollection.snapshots().listen((snapshot) {
-        for (final doc in snapshot.docs) {
-          final data = doc.data();
-          _peerConnection!.addCandidate(RTCIceCandidate(
-            data['candidate'],
-            data['sdpMid'],
-            data['sdpMLineIndex'],
-          ));
-        }
-      });
-    } else {
-      // Join as callee
-      final snapshot = await roomRef.get();
-      if (snapshot.exists && snapshot.data()!.containsKey('offer')) {
-        final offer = snapshot.data()!['offer'];
+    // Listen for answer
+    roomRef.snapshots().listen((snapshot) async {
+      if (snapshot.data()?.containsKey('answer') ?? false) {
+        final answer = snapshot.data()!['answer'];
         await _peerConnection!.setRemoteDescription(
-          RTCSessionDescription(offer['sdp'], offer['type']),
+          RTCSessionDescription(answer['sdp'], answer['type']),
         );
-
-        final answer = await _peerConnection!.createAnswer();
-        await _peerConnection!.setLocalDescription(answer);
-        await roomRef.update({'answer': answer.toMap()});
-
-        // Listen for caller ICE candidates
-        callerCandidatesCollection.snapshots().listen((snapshot) {
-          for (final doc in snapshot.docs) {
-            final data = doc.data();
-            _peerConnection!.addCandidate(RTCIceCandidate(
-              data['candidate'],
-              data['sdpMid'],
-              data['sdpMLineIndex'],
-            ));
-          }
-        });
-
-        // Listen for new callee ICE candidates
-        calleeCandidatesCollection.snapshots().listen((snapshot) {
-          for (final doc in snapshot.docs) {
-            final data = doc.data();
-            _peerConnection!.addCandidate(RTCIceCandidate(
-              data['candidate'],
-              data['sdpMid'],
-              data['sdpMLineIndex'],
-            ));
-          }
-        });
       }
+    });
+
+    // Listen for callee ICE candidates
+    roomRef.collection('calleeCandidates').snapshots().listen((snapshot) {
+      _processCandidates(snapshot.docs);
+    });
+  }
+
+  Future<void> _listenForOffer() async {
+    final roomRef = _firestore.collection('rooms').doc(widget.roomId);
+    final snapshot = await roomRef.get();
+
+    if (snapshot.exists && snapshot.data()!.containsKey('offer')) {
+      final offer = snapshot.data()!['offer'];
+      await _peerConnection!.setRemoteDescription(
+        RTCSessionDescription(offer['sdp'], offer['type']),
+      );
+
+      final answer = await _peerConnection!.createAnswer();
+      await _peerConnection!.setLocalDescription(answer);
+      await roomRef.update({'answer': answer.toMap()});
+
+      // Listen for caller ICE candidates
+      roomRef.collection('callerCandidates').snapshots().listen((snapshot) {
+        _processCandidates(snapshot.docs);
+      });
     }
   }
-  sharescreen() async{
-       final Map<String, dynamic> constraints = {
+
+  void _processCandidates(List<DocumentSnapshot> docs) {
+    for (final doc in docs) {
+      final data = doc.data() as Map<String, dynamic>;
+      _peerConnection!.addCandidate(RTCIceCandidate(
+        data['candidate'],
+        data['sdpMid'],
+        data['sdpMLineIndex'],
+      ));
+    }
+  }
+
+  Future<void> toggleScreenSharing() async {
+    try {
+      if (_isSharingScreen) {
+        await _stopScreenSharing();
+      } else {
+        await _startScreenSharing();
+      }
+    } catch (e) {
+      _showErrorDialog('Screen sharing error: ${e.toString()}');
+    }
+  }
+
+  Future<void> _startScreenSharing() async {
+    final constraints = {
       'video': {
-        // Preferred constraints (not mandatory)
         'width': {'ideal': MediaQuery.of(context).size.width},
         'height': {'ideal': MediaQuery.of(context).size.height},
         'frameRate': {'ideal': 30},
       },
       'audio': false,
     };
-          _screenStream = await navigator.mediaDevices.getDisplayMedia(
-            constraints
-);
-    if (_localStream != null) {
-      _screenStream = await _localStream!.clone();
-      _peerConnection!.addStream(_screenStream!);
-      _remoteRenderer.srcObject = _screenStream;
-      setState(() async{
-              _localStream = _screenStream;
-      _localRenderer.srcObject = _localStream;
-      await _peerConnection?.addStream(_localStream!);
-      });
-    } else {
-      print('No local stream available to share.');
-    }
-    
+
+    _screenStream = await navigator.mediaDevices.getDisplayMedia(constraints);
+    _peerConnection?.removeStream(_localStream!);
+    _peerConnection?.addStream(_screenStream!);
+    _localRenderer.srcObject = _screenStream;
+
+    _screenStream?.getVideoTracks().first.onEnded = () {
+      if (mounted) toggleScreenSharing();
+    };
+
+    setState(() => _isSharingScreen = true);
   }
+
+  Future<void> _stopScreenSharing() async {
+    _screenStream?.getTracks().forEach((track) => track.stop());
+    _peerConnection?.removeStream(_screenStream!);
+    _peerConnection?.addStream(_localStream!);
+    _localRenderer.srcObject = _localStream;
+    setState(() => _isSharingScreen = false);
+  }
+
+  void _showErrorDialog(String message) {
+    if (!mounted) return;
+    
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Error'),
+        content: Text(message),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('OK'),
+          ),
+        ],
+      ),
+    );
+  }
+
   @override
   void dispose() {
     _localRenderer.dispose();
     _remoteRenderer.dispose();
     _peerConnection?.close();
     _localStream?.dispose();
+    _screenStream?.dispose();
     super.dispose();
   }
 
@@ -189,21 +241,46 @@ class _VideoCallScreenState extends State<VideoCallScreen> {
       body: Column(
         children: [
           Expanded(
-            child: Row(
+            child: Stack(
               children: [
-                Expanded(child: RTCVideoView(_localRenderer, mirror: true)),
-                Expanded(child: RTCVideoView(_remoteRenderer)),
+                Row(
+                  children: [
+                    Expanded(child: RTCVideoView(_localRenderer, mirror: true)),
+                    Expanded(child: RTCVideoView(_remoteRenderer)),
+                  ],
+                ),
+                if (_hasCameraError)
+                  Positioned(
+                    top: 20,
+                    left: 20,
+                    child: Chip(
+                      label: const Text('Camera not available'),
+                      backgroundColor: Colors.red.withOpacity(0.7),
+                    ),
+                  ),
+                if (_hasMicError)
+                  Positioned(
+                    top: 50,
+                    left: 20,
+                    child: Chip(
+                      label: const Text('Microphone not available'),
+                      backgroundColor: Colors.red.withOpacity(0.7),
+                    ),
+                  ),
               ],
             ),
           ),
-          Expanded(
+          Padding(
+            padding: const EdgeInsets.all(16.0),
             child: Row(
+              mainAxisAlignment: MainAxisAlignment.center,
               children: [
                 ElevatedButton(
-                  onPressed: () {
-                    sharescreen();
-                  },
-                  child: const Text('Share Screen'),
+                  onPressed: toggleScreenSharing,
+                  child: Text(_isSharingScreen ? 'Stop Sharing' : 'Share Screen'),
+                  style: ElevatedButton.styleFrom(
+                    padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 16),
+                  ),
                 ),
               ],
             ),
