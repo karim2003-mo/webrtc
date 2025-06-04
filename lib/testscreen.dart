@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
+import 'dart:async';
 
 class VideoCallScreen extends StatefulWidget {
   final String roomId;
@@ -21,7 +22,14 @@ class _VideoCallScreenState extends State<VideoCallScreen> {
   bool _isSharingScreen = false;
   bool _hasCameraError = false;
   bool _hasMicError = false;
+  bool _isAudioEnabled = true;
+  bool _isVideoEnabled = true;
+  bool _isCallActive = false;
   final _firestore = FirebaseFirestore.instance;
+  
+  // Stream subscriptions for cleanup
+  StreamSubscription? _roomSubscription;
+  StreamSubscription? _candidatesSubscription;
 
   @override
   void initState() {
@@ -30,15 +38,21 @@ class _VideoCallScreenState extends State<VideoCallScreen> {
   }
 
   Future<void> _initRenderers() async {
-    await _localRenderer.initialize();
-    await _remoteRenderer.initialize();
+    try {
+      await _localRenderer.initialize();
+      await _remoteRenderer.initialize();
+    } catch (e) {
+      print('Renderer initialization error: $e');
+      _showErrorDialog('Failed to initialize video renderers');
+    }
   }
 
   Future<void> _startCall() async {
     try {
       final config = {
         'iceServers': [
-          {'urls': 'stun:stun.l.google.com:19302'}
+          {'urls': 'stun:stun.l.google.com:19302'},
+          {'urls': 'stun:stun1.l.google.com:19302'},
         ]
       };
 
@@ -47,15 +61,35 @@ class _VideoCallScreenState extends State<VideoCallScreen> {
       // Try to get media with video first
       try {
         _localStream = await _getUserMedia(withVideo: true);
-        _localRenderer.srcObject = _localStream;
-        _peerConnection!.addStream(_localStream!);
+        if (mounted) {
+          _localRenderer.srcObject = _localStream;
+          _localStream?.getTracks().forEach((track) {
+            _peerConnection!.addTrack(track, _localStream!);
+          });
+        }
       } catch (e) {
         print('Video error: $e');
         // Try without video if video fails
-        _localStream = await _getUserMedia(withVideo: false);
-        _localRenderer.srcObject = _localStream;
-        _peerConnection!.addStream(_localStream!);
-        setState(() => _hasCameraError = true);
+        try {
+          _localStream = await _getUserMedia(withVideo: false);
+          if (mounted) {
+            _localRenderer.srcObject = _localStream;
+            _localStream?.getTracks().forEach((track) {
+              _peerConnection!.addTrack(track, _localStream!);
+            });
+            setState(() => _hasCameraError = true);
+          }
+        } catch (audioError) {
+          print('Audio error: $audioError');
+          if (mounted) {
+            setState(() {
+              _hasCameraError = true;
+              _hasMicError = true;
+            });
+          }
+          _showErrorDialog('Cannot access camera or microphone');
+          return;
+        }
       }
 
       _setupPeerConnectionListeners();
@@ -65,6 +99,8 @@ class _VideoCallScreenState extends State<VideoCallScreen> {
       } else {
         await _listenForOffer();
       }
+      
+      setState(() => _isCallActive = true);
     } catch (e) {
       print('Call setup error: $e');
       _showErrorDialog('Failed to start call: ${e.toString()}');
@@ -73,98 +109,164 @@ class _VideoCallScreenState extends State<VideoCallScreen> {
 
   Future<MediaStream> _getUserMedia({bool withVideo = true}) async {
     try {
-      final media = await navigator.mediaDevices.getUserMedia({
-        'audio': true,
+      final constraints = {
+        'audio': {
+          'echoCancellation': true,
+          'noiseSuppression': true,
+        },
         'video': withVideo ? {
-          'width': {'ideal': 1280},
-          'height': {'ideal': 720},
-          'facingMode': 'user'
+          'width': {'ideal': 1280, 'max': 1920},
+          'height': {'ideal': 720, 'max': 1080},
+          'facingMode': 'user',
+          'frameRate': {'ideal': 30},
         } : false,
-      });
+      };
+
+      final media = await navigator.mediaDevices.getUserMedia(constraints);
       return media;
     } catch (e) {
-      if (e.toString().contains('audio')) {
-        setState(() => _hasMicError = true);
+      if (e.toString().toLowerCase().contains('audio')) {
+        if (mounted) setState(() => _hasMicError = true);
       }
       rethrow;
     }
   }
 
   void _setupPeerConnectionListeners() {
-    final roomRef = _firestore.collection('rooms').doc(widget.roomId);
-    final callerCandidates = roomRef.collection('callerCandidates');
-    final calleeCandidates = roomRef.collection('calleeCandidates');
-
     _peerConnection!.onIceCandidate = (candidate) async {
-      final json = {
-        'candidate': candidate.candidate,
-        'sdpMid': candidate.sdpMid,
-        'sdpMLineIndex': candidate.sdpMLineIndex,
-      };
+      if (candidate.candidate != null) {
+        final roomRef = _firestore.collection('rooms').doc(widget.roomId);
+        final candidatesCollection = widget.isCaller 
+            ? roomRef.collection('callerCandidates')
+            : roomRef.collection('calleeCandidates');
 
-      await (widget.isCaller ? callerCandidates : calleeCandidates).add(json);
+        final json = {
+          'candidate': candidate.candidate,
+          'sdpMid': candidate.sdpMid,
+          'sdpMLineIndex': candidate.sdpMLineIndex,
+          'timestamp': FieldValue.serverTimestamp(),
+        };
+
+        try {
+          await candidatesCollection.add(json);
+        } catch (e) {
+          print('Error adding ICE candidate: $e');
+        }
+      }
     };
 
-    _peerConnection!.onAddStream = (stream) {
-      _remoteRenderer.srcObject = stream;
+    _peerConnection!.onTrack = (event) {
+      if (event.streams.isNotEmpty && mounted) {
+        setState(() {
+          _remoteRenderer.srcObject = event.streams[0];
+        });
+      }
+    };
+
+    _peerConnection!.onConnectionState = (state) {
+      print('Connection state: $state');
+      if (state == RTCPeerConnectionState.RTCPeerConnectionStateFailed ||
+          state == RTCPeerConnectionState.RTCPeerConnectionStateDisconnected) {
+        if (mounted) {
+          _showErrorDialog('Connection lost. Please try again.');
+        }
+      }
     };
   }
 
   Future<void> _createOffer() async {
-    final roomRef = _firestore.collection('rooms').doc(widget.roomId);
-    final offer = await _peerConnection!.createOffer();
-    await _peerConnection!.setLocalDescription(offer);
-    await roomRef.set({'offer': offer.toMap()});
+    try {
+      final roomRef = _firestore.collection('rooms').doc(widget.roomId);
+      
+      final offer = await _peerConnection!.createOffer();
+      await _peerConnection!.setLocalDescription(offer);
+      
+      await roomRef.set({
+        'offer': offer.toMap(),
+        'createdAt': FieldValue.serverTimestamp(),
+      });
 
-    // Listen for answer
-    roomRef.snapshots().listen((snapshot) async {
-      if (snapshot.data()?.containsKey('answer') ?? false) {
-        final answer = snapshot.data()!['answer'];
-        await _peerConnection!.setRemoteDescription(
-          RTCSessionDescription(answer['sdp'], answer['type']),
-        );
-      }
-    });
+      // Listen for answer
+      _roomSubscription = roomRef.snapshots().listen((snapshot) async {
+        final data = snapshot.data();
+        if (data != null && data.containsKey('answer') && _peerConnection != null) {
+          try {
+            final answer = data['answer'];
+            final remoteDesc = RTCSessionDescription(answer['sdp'], answer['type']);
+            await _peerConnection!.setRemoteDescription(remoteDesc);
+          } catch (e) {
+            print('Error setting remote description: $e');
+          }
+        }
+      });
 
-    // Listen for callee ICE candidates
-    roomRef.collection('calleeCandidates').snapshots().listen((snapshot) {
-      _processCandidates(snapshot.docs);
-    });
+      // Listen for callee ICE candidates
+      _candidatesSubscription = roomRef.collection('calleeCandidates')
+          .orderBy('timestamp')
+          .snapshots()
+          .listen((snapshot) {
+        _processCandidates(snapshot.docs);
+      });
+    } catch (e) {
+      print('Create offer error: $e');
+      _showErrorDialog('Failed to create offer');
+    }
   }
 
   Future<void> _listenForOffer() async {
-    final roomRef = _firestore.collection('rooms').doc(widget.roomId);
-    final snapshot = await roomRef.get();
+    try {
+      final roomRef = _firestore.collection('rooms').doc(widget.roomId);
+      final snapshot = await roomRef.get();
 
-    if (snapshot.exists && snapshot.data()!.containsKey('offer')) {
-      final offer = snapshot.data()!['offer'];
-      await _peerConnection!.setRemoteDescription(
-        RTCSessionDescription(offer['sdp'], offer['type']),
-      );
+      if (snapshot.exists) {
+        final data = snapshot.data()!;
+        if (data.containsKey('offer')) {
+          final offer = data['offer'];
+          final remoteDesc = RTCSessionDescription(offer['sdp'], offer['type']);
+          await _peerConnection!.setRemoteDescription(remoteDesc);
 
-      final answer = await _peerConnection!.createAnswer();
-      await _peerConnection!.setLocalDescription(answer);
-      await roomRef.update({'answer': answer.toMap()});
+          final answer = await _peerConnection!.createAnswer();
+          await _peerConnection!.setLocalDescription(answer);
+          
+          await roomRef.update({
+            'answer': answer.toMap(),
+            'answeredAt': FieldValue.serverTimestamp(),
+          });
 
-      // Listen for caller ICE candidates
-      roomRef.collection('callerCandidates').snapshots().listen((snapshot) {
-        _processCandidates(snapshot.docs);
-      });
+          // Listen for caller ICE candidates
+          _candidatesSubscription = roomRef.collection('callerCandidates')
+              .orderBy('timestamp')
+              .snapshots()
+              .listen((snapshot) {
+            _processCandidates(snapshot.docs);
+          });
+        }
+      }
+    } catch (e) {
+      print('Listen for offer error: $e');
+      _showErrorDialog('Failed to join call');
     }
   }
 
   void _processCandidates(List<DocumentSnapshot> docs) {
     for (final doc in docs) {
-      final data = doc.data() as Map<String, dynamic>;
-      _peerConnection!.addCandidate(RTCIceCandidate(
-        data['candidate'],
-        data['sdpMid'],
-        data['sdpMLineIndex'],
-      ));
+      try {
+        final data = doc.data() as Map<String, dynamic>;
+        final candidate = RTCIceCandidate(
+          data['candidate'],
+          data['sdpMid'],
+          data['sdpMLineIndex'],
+        );
+        _peerConnection?.addCandidate(candidate);
+      } catch (e) {
+        print('Error processing candidate: $e');
+      }
     }
   }
 
   Future<void> toggleScreenSharing() async {
+    if (!_isCallActive) return;
+    
     try {
       if (_isSharingScreen) {
         await _stopScreenSharing();
@@ -172,38 +274,117 @@ class _VideoCallScreenState extends State<VideoCallScreen> {
         await _startScreenSharing();
       }
     } catch (e) {
+      print('Screen sharing error: $e');
       _showErrorDialog('Screen sharing error: ${e.toString()}');
     }
   }
 
   Future<void> _startScreenSharing() async {
-    final constraints = {
-      'video': {
-        'width': {'ideal': MediaQuery.of(context).size.width},
-        'height': {'ideal': MediaQuery.of(context).size.height},
-        'frameRate': {'ideal': 30},
-      },
-      'audio': false,
-    };
+    try {
+      final constraints = {
+        'video': {
+          'width': {'ideal': 1920, 'max': 1920},
+          'height': {'ideal': 1080, 'max': 1080},
+          'frameRate': {'ideal': 15, 'max': 30},
+        },
+        'audio': false,
+      };
 
-    _screenStream = await navigator.mediaDevices.getDisplayMedia(constraints);
-    _peerConnection?.removeStream(_localStream!);
-    _peerConnection?.addStream(_screenStream!);
-    _localRenderer.srcObject = _screenStream;
+      _screenStream = await navigator.mediaDevices.getDisplayMedia(constraints);
+      
+      if (_screenStream != null && mounted) {
+        // Replace video track
+        final videoTrack = _screenStream!.getVideoTracks().first;
+        final sender = await _peerConnection?.getSenders().then((senders) =>
+            senders.firstWhere((s) => s.track?.kind == 'video'));
+        
+        if (sender != null) {
+          await sender.replaceTrack(videoTrack);
+        }
+        
+        _localRenderer.srcObject = _screenStream;
 
-    _screenStream?.getVideoTracks().first.onEnded = () {
-      if (mounted) toggleScreenSharing();
-    };
+        // Handle screen share end
+        videoTrack.onEnded = () {
+          if (mounted && _isSharingScreen) {
+            toggleScreenSharing();
+          }
+        };
 
-    setState(() => _isSharingScreen = true);
+        setState(() => _isSharingScreen = true);
+      }
+    } catch (e) {
+      print('Start screen sharing error: $e');
+      rethrow;
+    }
   }
 
   Future<void> _stopScreenSharing() async {
-    _screenStream?.getTracks().forEach((track) => track.stop());
-    _peerConnection?.removeStream(_screenStream!);
-    _peerConnection?.addStream(_localStream!);
-    _localRenderer.srcObject = _localStream;
-    setState(() => _isSharingScreen = false);
+    try {
+      if (_screenStream != null) {
+        _screenStream!.getTracks().forEach((track) => track.stop());
+        
+        // Replace with camera track
+        if (_localStream != null) {
+          final videoTrack = _localStream!.getVideoTracks().isNotEmpty 
+              ? _localStream!.getVideoTracks().first 
+              : null;
+          
+          if (videoTrack != null) {
+            final sender = await _peerConnection?.getSenders().then((senders) =>
+                senders.firstWhere((s) => s.track?.kind == 'video'));
+            
+            if (sender != null) {
+              await sender.replaceTrack(videoTrack);
+            }
+          }
+          
+          _localRenderer.srcObject = _localStream;
+        }
+        
+        _screenStream = null;
+        setState(() => _isSharingScreen = false);
+      }
+    } catch (e) {
+      print('Stop screen sharing error: $e');
+      rethrow;
+    }
+  }
+
+  Future<void> _toggleAudio() async {
+    if (_localStream != null) {
+      final audioTracks = _localStream!.getAudioTracks();
+      if (audioTracks.isNotEmpty) {
+        final enabled = !_isAudioEnabled;
+        audioTracks.first.enabled = enabled;
+        setState(() => _isAudioEnabled = enabled);
+      }
+    }
+  }
+
+  Future<void> _toggleVideo() async {
+    if (_localStream != null && !_isSharingScreen) {
+      final videoTracks = _localStream!.getVideoTracks();
+      if (videoTracks.isNotEmpty) {
+        final enabled = !_isVideoEnabled;
+        videoTracks.first.enabled = enabled;
+        setState(() => _isVideoEnabled = enabled);
+      }
+    }
+  }
+
+  Future<void> _endCall() async {
+    try {
+      // Clean up room data
+      final roomRef = _firestore.collection('rooms').doc(widget.roomId);
+      await roomRef.delete();
+    } catch (e) {
+      print('Error deleting room: $e');
+    }
+    
+    if (Navigator.canPop(context)) {
+      Navigator.pop(context);
+    }
   }
 
   void _showErrorDialog(String message) {
@@ -211,12 +392,16 @@ class _VideoCallScreenState extends State<VideoCallScreen> {
     
     showDialog(
       context: context,
+      barrierDismissible: false,
       builder: (ctx) => AlertDialog(
         title: const Text('Error'),
         content: Text(message),
         actions: [
           TextButton(
-            onPressed: () => Navigator.pop(ctx),
+            onPressed: () {
+              Navigator.pop(ctx);
+              _endCall();
+            },
             child: const Text('OK'),
           ),
         ],
@@ -226,66 +411,164 @@ class _VideoCallScreenState extends State<VideoCallScreen> {
 
   @override
   void dispose() {
+    // Cancel subscriptions
+    _roomSubscription?.cancel();
+    _candidatesSubscription?.cancel();
+    
+    // Dispose renderers
     _localRenderer.dispose();
     _remoteRenderer.dispose();
+    
+    // Close peer connection
     _peerConnection?.close();
+    _peerConnection = null;
+    
+    // Stop media streams
+    _localStream?.getTracks().forEach((track) => track.stop());
     _localStream?.dispose();
+    _screenStream?.getTracks().forEach((track) => track.stop());
     _screenStream?.dispose();
+    
     super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
-    return Scaffold(
-      appBar: AppBar(title: const Text('Video Call')),
-      body: Column(
-        children: [
-          Expanded(
-            child: Stack(
-              children: [
-                Row(
-                  children: [
-                    Expanded(child: RTCVideoView(_localRenderer, mirror: true)),
-                    Expanded(child: RTCVideoView(_remoteRenderer)),
-                  ],
-                ),
-                if (_hasCameraError)
-                  Positioned(
-                    top: 20,
-                    left: 20,
-                    child: Chip(
-                      label: const Text('Camera not available'),
-                      backgroundColor: Colors.red.withOpacity(0.7),
-                    ),
-                  ),
-                if (_hasMicError)
-                  Positioned(
-                    top: 50,
-                    left: 20,
-                    child: Chip(
-                      label: const Text('Microphone not available'),
-                      backgroundColor: Colors.red.withOpacity(0.7),
-                    ),
-                  ),
-              ],
-            ),
+    return WillPopScope(
+      onWillPop: () async {
+        await _endCall();
+        return false;
+      },
+      child: Scaffold(
+        backgroundColor: Colors.black,
+        appBar: AppBar(
+          title: Text('Video Call - ${widget.roomId}'),
+          backgroundColor: Colors.black87,
+          leading: IconButton(
+            icon: const Icon(Icons.arrow_back),
+            onPressed: _endCall,
           ),
-          Padding(
-            padding: const EdgeInsets.all(16.0),
-            child: Row(
-              mainAxisAlignment: MainAxisAlignment.center,
-              children: [
-                ElevatedButton(
-                  onPressed: toggleScreenSharing,
-                  child: Text(_isSharingScreen ? 'Stop Sharing' : 'Share Screen'),
-                  style: ElevatedButton.styleFrom(
-                    padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 16),
+        ),
+        body: Column(
+          children: [
+            Expanded(
+              child: Stack(
+                children: [
+                  // Main video views
+                  Row(
+                    children: [
+                      Expanded(
+                        child: Container(
+                          decoration: BoxDecoration(
+                            border: Border.all(color: Colors.white24),
+                          ),
+                          child: RTCVideoView(
+                            _localRenderer,
+                            mirror: true,
+                            objectFit: RTCVideoViewObjectFit.RTCVideoViewObjectFitCover,
+                          ),
+                        ),
+                      ),
+                      Expanded(
+                        child: Container(
+                          decoration: BoxDecoration(
+                            border: Border.all(color: Colors.white24),
+                          ),
+                          child: RTCVideoView(
+                            _remoteRenderer,
+                            objectFit: RTCVideoViewObjectFit.RTCVideoViewObjectFitCover,
+                          ),
+                        ),
+                      ),
+                    ],
                   ),
-                ),
-              ],
+                  // Error indicators
+                  if (_hasCameraError)
+                    Positioned(
+                      top: 20,
+                      left: 20,
+                      child: Chip(
+                        label: const Text('Camera unavailable', style: TextStyle(color: Colors.white)),
+                        backgroundColor: Colors.red.withOpacity(0.8),
+                        avatar: const Icon(Icons.videocam_off, color: Colors.white, size: 16),
+                      ),
+                    ),
+                  if (_hasMicError)
+                    Positioned(
+                      top: _hasCameraError ? 60 : 20,
+                      left: 20,
+                      child: Chip(
+                        label: const Text('Microphone unavailable', style: TextStyle(color: Colors.white)),
+                        backgroundColor: Colors.red.withOpacity(0.8),
+                        avatar: const Icon(Icons.mic_off, color: Colors.white, size: 16),
+                      ),
+                    ),
+                  // Status indicators
+                  if (_isSharingScreen)
+                    Positioned(
+                      top: 20,
+                      right: 20,
+                      child: Chip(
+                        label: const Text('Sharing Screen', style: TextStyle(color: Colors.white)),
+                        backgroundColor: Colors.green.withOpacity(0.8),
+                        avatar: const Icon(Icons.screen_share, color: Colors.white, size: 16),
+                      ),
+                    ),
+                ],
+              ),
             ),
-          ),
-        ],
+            // Control buttons
+            Container(
+              padding: const EdgeInsets.all(16.0),
+              color: Colors.black87,
+              child: Row(
+                mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+                children: [
+                  _buildControlButton(
+                    icon: _isAudioEnabled ? Icons.mic : Icons.mic_off,
+                    onPressed: _toggleAudio,
+                    isActive: _isAudioEnabled,
+                  ),
+                  _buildControlButton(
+                    icon: _isVideoEnabled ? Icons.videocam : Icons.videocam_off,
+                    onPressed: _isSharingScreen ? null : _toggleVideo,
+                    isActive: _isVideoEnabled,
+                  ),
+                  _buildControlButton(
+                    icon: _isSharingScreen ? Icons.stop_screen_share : Icons.screen_share,
+                    onPressed: toggleScreenSharing,
+                    isActive: _isSharingScreen,
+                  ),
+                  _buildControlButton(
+                    icon: Icons.call_end,
+                    onPressed: _endCall,
+                    isActive: false,
+                    backgroundColor: Colors.red,
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildControlButton({
+    required IconData icon,
+    required VoidCallback? onPressed,
+    required bool isActive,
+    Color? backgroundColor,
+  }) {
+    return Container(
+      decoration: BoxDecoration(
+        shape: BoxShape.circle,
+        color: backgroundColor ?? (isActive ? Colors.blue : Colors.grey),
+      ),
+      child: IconButton(
+        icon: Icon(icon, color: Colors.white),
+        onPressed: onPressed,
+        iconSize: 28,
       ),
     );
   }
