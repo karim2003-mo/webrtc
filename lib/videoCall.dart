@@ -22,14 +22,15 @@ class _VideoCallScreenState extends State<VideoCallScreen> {
   late String roomId;
   late String hostId;
   final RTCVideoRenderer _localRenderer = RTCVideoRenderer();
+  final RTCVideoRenderer _remoterenderer = RTCVideoRenderer();
   MediaStream? _localStream;
-  MediaStream? _screenStreem;
   RTCRtpSender? videoSender;
   final FirebaseDataSource _dataSource = FirebaseDataSource();
   late RTCPeerConnection pc;
   Map<String, RTCPeerConnection> pcMap = {};
     Future<void> initRenderers() async {
     await _localRenderer.initialize();
+    await _remoterenderer.initialize();
   }
   getRoomAndSessionId() async{
     if(widget.isHost){
@@ -176,7 +177,9 @@ void initState() {
       }
     });
     pc.onTrack = (RTCTrackEvent event) {
-        _localRenderer.srcObject = event.streams[0];
+      setState(() {
+        _remoterenderer.srcObject = event.streams[0];
+      });
     };
   }
   @override
@@ -189,7 +192,7 @@ void initState() {
       body: Center(
         child:Column(
           children: [Expanded(child: Container(width: size.width*0.8,
-          child: RTCVideoView(_localRenderer, mirror: true, objectFit: RTCVideoViewObjectFit.RTCVideoViewObjectFitCover,),
+          child: RTCVideoView((widget.isHost)?_localRenderer:_remoterenderer, mirror: true, objectFit: RTCVideoViewObjectFit.RTCVideoViewObjectFitCover,),
           ))],
 
         )
