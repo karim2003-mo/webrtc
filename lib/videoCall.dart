@@ -194,7 +194,7 @@ void initState() {
           children: [Expanded(child: Container(width: size.width*0.8,
           child: RTCVideoView((widget.isHost)?_localRenderer:_remoterenderer, mirror: true, objectFit: RTCVideoViewObjectFit.RTCVideoViewObjectFitCover,),
           ))],
-
+// ggggggggggggggggggggggggg
         )
       ),
     );
