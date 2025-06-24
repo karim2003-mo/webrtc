@@ -81,31 +81,6 @@ void initState() {
     _localRenderer.srcObject = _localStream;
     return hasDevice;
   }
-  Future<void> _shareScreen() async{
-    _screenStreem = await navigator.mediaDevices.getDisplayMedia({
-      'video': true,
-      'audio': true,
-    });
-    final combinedStream = await createLocalMediaStream('combined');
-    _screenStreem!.getTracks().forEach((track) {
-      combinedStream.addTrack(track);
-    });
-    if (_localStream != null) {
-      _localStream!.getAudioTracks().forEach((track) {
-        combinedStream.addTrack(track);
-      });
-    }
-    setState(() {
-    _localRenderer.srcObject = _screenStreem;
-    videoSender!.replaceTrack(
-      _screenStreem!.getVideoTracks()[0]
-    );
-    for(var track in combinedStream.getTracks()){
-      for(var participantId in pcMap.keys.toList()){
-        pcMap[participantId]!.addTrack(track, combinedStream);
-      }
-    }});
-  }
   Future<void> startHost() async{
     final result = await _getUserMedia();
     _localRenderer.srcObject = _localStream;
