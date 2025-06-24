@@ -52,11 +52,12 @@ class FirebaseDataSource {
       }
     });
   }
-  pushOffer({required Map<String, dynamic> offer, required String roomId,required String hostId}) async {
+  pushOffer({required Map<String, dynamic> offer, required String roomId,
+  required String hostId, required String listenerId}) async {
 
     print("room Id is ======================>>>>>>>>>> $roomId");
     try {
-      await _firestore.collection('rooms').doc(roomId).collection('organizer').doc(hostId).set({
+      await _firestore.collection('rooms').doc(roomId).collection('organizer').doc(hostId).collection('offers').doc(listenerId).set({
         'offer': offer
       });
       
@@ -64,11 +65,11 @@ class FirebaseDataSource {
       print('Error pushing offer: $e');
     }
   }
-  getoffer(String roomId) async {
+  getoffer({required String roomId , required String hostId , required String listenerId} ) async {
     try {
-      final offerSnapshot = await _firestore.collection('rooms').doc(roomId).collection('organizer').get();
-      if (offerSnapshot.docs.isNotEmpty) {
-        return offerSnapshot.docs.first.data()['offer'];
+      final offerSnapshot = await _firestore.collection('rooms').doc(roomId).collection('organizer').doc(hostId).collection('offers').doc(listenerId).get();
+      if (offerSnapshot.exists) {
+        return offerSnapshot['offer'];
       }
     } catch (e) {
       print('Error getting offer: $e');

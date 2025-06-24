@@ -118,7 +118,7 @@ void initState() {
         print("listener has been added to pcMap");
     final offer=await pcMap[participantId]!.createOffer();
     await pcMap[participantId]!.setLocalDescription(offer);
-    await _dataSource.pushOffer(roomId: roomId, offer: offer.toMap(),hostId: hostId);
+    await _dataSource.pushOffer(roomId: roomId, offer: offer.toMap(),hostId: hostId , listenerId: participantId);
 
     pcMap[participantId]!.onIceCandidate = (RTCIceCandidate candidate) async {
       if (candidate != null) {
@@ -161,15 +161,20 @@ void initState() {
   Future<void> startListener() async{
     final participantId=await _dataSource.addListener(roomId);
     print("fromstartListener==============================$participantId");
-    if (pcMap.containsKey(participantId)) {
-      print("Participant already exists, skipping initialization.");
-      return;
-    }
     print("%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%");
     print("fromstartListener----------------room Id is ==============================$roomId");
     
-      final offer=await _dataSource.getoffer(roomId);
+      final offer=await _dataSource.getoffer(hostId: hostId, roomId: roomId, listenerId: participantId);
     print("%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%");
+        await Future.delayed(Duration(seconds: 10), () {
+  // Code to run after 2 seconds
+  print("This runs after 2 seconds");
+});
+    if (pcMap.containsKey(participantId)) {
+      print("Participant already exists, skipping initialization.");
+    }else{
+      print("Participant doesn't exist, skipping initialization.");
+    }
       await pcMap[participantId]?.setRemoteDescription(RTCSessionDescription(offer['sdp'], offer['type']));
       final answer=await pcMap[participantId]!.createAnswer();
       await _dataSource.sendListeneranswer(roomId: roomId, answer: answer.toMap(),participantId: participantId);
