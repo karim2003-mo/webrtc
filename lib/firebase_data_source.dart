@@ -39,11 +39,11 @@ class FirebaseDataSource {
     }
     return null;
   }
-  sendHostIceCandidates({required String roomId,required String hostId,required RTCIceCandidate candidate}) async{
+  sendHostIceCandidates({required String roomId,required String hostId,required String listenerId,required RTCIceCandidate candidate}) async{
     await _firestore.collection('rooms')
     .doc(roomId)
     .collection('organizer')
-    .doc(hostId)
+    .doc(hostId).collection("candidates").doc(listenerId)
     .set({
       'candidates': {
         'candidate': candidate.candidate,
@@ -69,7 +69,11 @@ class FirebaseDataSource {
     try {
       final offerSnapshot = await _firestore.collection('rooms').doc(roomId).collection('organizer').doc(hostId).collection('offers').doc(listenerId).get();
       if (offerSnapshot.exists) {
+        print(offerSnapshot['offer']);
         return offerSnapshot['offer'];
+      }
+      else {
+        print('+++++++++++++++++++++++++++++Offer does not exist======================');
       }
     } catch (e) {
       print('Error getting offer: $e');
@@ -134,13 +138,12 @@ class FirebaseDataSource {
     }
     return null;
   }
-   Future<CollectionReference<Map<String, dynamic>>> getHostIceCandidates(String roomId, String hostId) async {
+   Future<CollectionReference<Map<String, dynamic>>> getHostIceCandidates({required String roomId,required String hostId,required String listenerId}) async {
     try {
        return _firestore.collection('rooms')
-        .doc(roomId)
-        .collection('organizer')
-        .doc(hostId)
-        .collection('candidates');
+    .doc(roomId)
+    .collection('organizer')
+    .doc(hostId).collection("candidates").doc(listenerId).collection('candidates');
     } catch (e) {
       throw Exception('Error getting host ICE candidates: $e');
     }

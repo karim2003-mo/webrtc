@@ -26,6 +26,7 @@ class _VideoCallScreenState extends State<VideoCallScreen> {
   MediaStream? _screenStreem;
   RTCRtpSender? videoSender;
   final FirebaseDataSource _dataSource = FirebaseDataSource();
+  late RTCPeerConnection pc;
   Map<String, RTCPeerConnection> pcMap = {};
     Future<void> initRenderers() async {
     await _localRenderer.initialize();
@@ -47,6 +48,7 @@ void initState() {
   WidgetsBinding.instance.addPostFrameCallback((_) async {
     await getRoomAndSessionId();
     await initRenderers();
+    pc=await createPeerConnection(config);
     
     if (widget.isHost==true) {
       await startHost();
@@ -113,7 +115,6 @@ void initState() {
       if (snapshot.docs.isNotEmpty) {
         final participantId = snapshot.docs.first.id;
         print("fromonNewListener==============================$participantId");
-        final pc=await createPeerConnection(config);
         pcMap[participantId] = pc;
         print("listener has been added to pcMap");
     final offer=await pcMap[participantId]!.createOffer();
@@ -122,11 +123,11 @@ void initState() {
 
     pcMap[participantId]!.onIceCandidate = (RTCIceCandidate candidate) async {
       if (candidate != null) {
-        await _dataSource.sendHostIceCandidates(roomId: roomId,hostId:hostId, candidate: candidate);
+        await _dataSource.sendHostIceCandidates(roomId: roomId,hostId:hostId, candidate: candidate , listenerId: participantId);
       }
     };
         _localStream!.getTracks().forEach((track) {
-          pc.addTrack(track, _localStream!);
+          pcMap[participantId]!.addTrack(track, _localStream!);
         });
             final candcollection= await _dataSource.getListenerIceCandidates(roomId, participantId);
     candcollection.snapshots().listen((snapshot) {
@@ -164,43 +165,42 @@ void initState() {
     print("%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%");
     print("fromstartListener----------------room Id is ==============================$roomId");
     
-      final offer=await _dataSource.getoffer(hostId: hostId, roomId: roomId, listenerId: participantId);
     print("%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%");
-        await Future.delayed(Duration(seconds: 10), () {
+        await Future.delayed(Duration(seconds: 5), () {
   // Code to run after 2 seconds
   print("This runs after 2 seconds");
 });
-    if (pcMap.containsKey(participantId)) {
+    if (pc!=null) {
       print("Participant already exists, skipping initialization.");
     }else{
       print("Participant doesn't exist, skipping initialization.");
     }
-      await pcMap[participantId]?.setRemoteDescription(RTCSessionDescription(offer['sdp'], offer['type']));
-      final answer=await pcMap[participantId]!.createAnswer();
+      final offer=await _dataSource.getoffer(hostId: hostId, roomId: roomId, listenerId: participantId);
+      await pc.setRemoteDescription(RTCSessionDescription(offer['sdp'], offer['type']));
+      final answer=await pc.createAnswer();
       await _dataSource.sendListeneranswer(roomId: roomId, answer: answer.toMap(),participantId: participantId);
-      await pcMap[participantId]!.setLocalDescription(answer);
-    pcMap[participantId]!.onIceCandidate = (RTCIceCandidate candidate) async {
+      await pc.setLocalDescription(answer);
+    pc.onIceCandidate = (RTCIceCandidate candidate) async {
       if (candidate != null) {
         await _dataSource.sendListenerIceCandidates(roomId: roomId, listenerId: participantId, candidate: candidate);
       }
     };
     if(offer!=null){
     }
-    final candcollection= await _dataSource.getHostIceCandidates(roomId, hostId);
+    final candcollection= await _dataSource.getHostIceCandidates(hostId: hostId, roomId: roomId, listenerId: participantId);
     candcollection.snapshots().listen((snapshot) {
       for (var doc in snapshot.docs) {
-        final data = doc.data();
-        if (data['candidate'] != null) {
+        if (doc.exists) {
           final candidate = RTCIceCandidate(
-            data['candidate'],
-            data['sdpMid'],
-            data['sdpMLineIndex'],
+            doc['candidate'],
+            doc['sdpMid'],
+            doc['sdpMLineIndex'],
           );
-          pcMap[participantId]!.addCandidate(candidate);
+          pc.addCandidate(candidate);
         }
       }
     });
-    pcMap[participantId]!.onTrack = (RTCTrackEvent event) {
+    pc.onTrack = (RTCTrackEvent event) {
         _localRenderer.srcObject = event.streams[0];
     };
   }
